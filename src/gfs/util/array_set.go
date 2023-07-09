@@ -1,6 +1,7 @@
 package util
 
 import (
+	"main/src/gfs"
 	"math/rand"
 	"sync"
 )
@@ -25,10 +26,25 @@ func (s *ArraySet) Add(element interface{}) {
 	s.arr = append(s.arr, element)
 }
 
-// Delete delete an element in the set.
-func (s *ArraySet) Delete(element interface{}) {
+func (s *ArraySet) copy() *ArraySet {
+	ret := new(ArraySet)
+	ret.arr = make([]interface{}, 0)
+	copy(ret.arr, s.arr)
+	return ret
+}
+
+func (s *ArraySet) Copy() *ArraySet {
 	s.lock.Lock()
 	defer s.lock.Unlock()
+	ret := new(ArraySet)
+	ret.arr = make([]interface{}, 0)
+	copy(ret.arr, s.arr)
+	return ret
+}
+
+// Delete delete an element in the set.
+func (s *ArraySet) Delete(element interface{}) {
+
 	for i, v := range s.arr {
 		if v == element {
 			s.arr = append(s.arr[:i], s.arr[i+1:]...)
@@ -51,6 +67,15 @@ func (s *ArraySet) RandomPick() interface{} {
 	return s.arr[rand.Intn(len(s.arr))]
 }
 
+func (s *ArraySet) RandomPickAndGetRest() (interface{}, *ArraySet) {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	index := rand.Intn(len(s.arr))
+	cp := s.copy()
+	cp.arr = append(cp.arr[:index], cp.arr[index+1:]...)
+	return s.arr[index], cp
+}
+
 // GetAll returns all elements of the set.
 func (s *ArraySet) GetAll() []interface{} {
 	s.lock.RLock()
@@ -65,4 +90,12 @@ func (s *ArraySet) GetAllAndClear() []interface{} {
 	old := s.arr
 	s.arr = make([]interface{}, 0)
 	return old
+}
+
+func (s *ArraySet) CastAllToServerAddress() []gfs.ServerAddress {
+	addrs := make([]gfs.ServerAddress, 0)
+	for _, replica := range s.GetAll() {
+		addrs = append(addrs, replica.(gfs.ServerAddress))
+	}
+	return addrs
 }

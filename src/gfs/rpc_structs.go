@@ -32,7 +32,9 @@ type CreateChunkReply struct {
 }
 
 type WriteChunkArg struct {
+	Handle      ChunkHandle
 	DataID      DataBufferID
+	DataLength  int
 	Offset      Offset
 	Secondaries []ServerAddress
 }
@@ -41,6 +43,7 @@ type WriteChunkReply struct {
 }
 
 type AppendChunkArg struct {
+	Handle      ChunkHandle
 	DataID      DataBufferID
 	Secondaries []ServerAddress
 }

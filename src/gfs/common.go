@@ -1,6 +1,9 @@
 package gfs
 
-import "time"
+import (
+	"math/rand"
+	"time"
+)
 
 type Path string
 type ServerAddress string
@@ -53,6 +56,18 @@ type Error struct {
 func (e Error) Error() string {
 	return e.Err
 }
+
+func NewHandle() ChunkHandle {
+	return ChunkHandle(rand.Int63())
+}
+
+//type ErrSuccess struct {
+//	Code ErrorCode
+//}
+//
+//func (e *ErrSuccess) Error() string {
+//	return "success"
+//}
 
 // system config
 const (
