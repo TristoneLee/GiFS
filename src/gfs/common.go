@@ -1,7 +1,8 @@
 package gfs
 
 import (
-	"math/rand"
+	atomic2 "github.com/uber-go/atomic"
+	"strconv"
 	"time"
 )
 
@@ -45,6 +46,7 @@ const (
 	WriteExceedChunkSize
 	ReadEOF
 	NotAvailableForCopy
+	RetryLatter
 )
 
 // extended error type with error code
@@ -57,19 +59,13 @@ func (e Error) Error() string {
 	return e.Err
 }
 
+var chunkCnt = atomic2.NewInt64(0)
+
 func NewHandle() ChunkHandle {
-	return ChunkHandle(rand.Int63())
+	chunkCnt.Add(1)
+	return ChunkHandle(chunkCnt.Load())
 }
 
-//type ErrSuccess struct {
-//	Code ErrorCode
-//}
-//
-//func (e *ErrSuccess) Error() string {
-//	return "success"
-//}
-
-// system config
 const (
 	LeaseExpire        = 2 * time.Second //1 * time.Minute
 	HeartbeatInterval  = 100 * time.Millisecond
@@ -85,3 +81,19 @@ const (
 	DownloadBufferExpire = 2 * time.Minute
 	DownloadBufferTick   = 10 * time.Second
 )
+
+func (p Path) String() string {
+	return string(p)
+}
+
+func (s ServerAddress) String() string {
+	return string(s)
+}
+
+func (c ChunkHandle) String() string {
+	return strconv.FormatInt(int64(c), 10)
+}
+
+func (o Offset) String() string {
+	return strconv.FormatInt(int64(o), 10)
+}

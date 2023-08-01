@@ -1,10 +1,10 @@
 package chunkserver
 
 import (
-	"sync"
+	"github.com/sasha-s/go-deadlock"
 	"time"
 
-	"main/src/gfs"
+	"gfsmain/src/gfs"
 )
 
 type downloadItem struct {
@@ -13,7 +13,7 @@ type downloadItem struct {
 }
 
 type downloadBuffer struct {
-	sync.RWMutex
+	deadlock.RWMutex
 	buffer map[gfs.DataBufferID]downloadItem
 	expire time.Duration
 	tick   time.Duration
@@ -51,8 +51,11 @@ func newDownloadBuffer(expire, tick time.Duration) *downloadBuffer {
 
 // allocate a new DataID for given handle
 func (buf *downloadBuffer) New(handle gfs.ChunkHandle) gfs.DataBufferID {
+	buf.Lock()
+	defer buf.Unlock()
 	now := time.Now()
 	timeStamp := now.Nanosecond() + now.Second()*1000 + now.Minute()*60*1000
+	time.Sleep(10 * time.Nanosecond)
 	return gfs.DataBufferID{handle, timeStamp}
 }
 

@@ -1,13 +1,15 @@
 package chunkserver
 
 import (
-	"main/src/gfs"
-	"main/src/gfs/util"
-	log "main/src/github.com/Sirupsen/logrus"
+	"gfsmain/src/gfs"
+	"gfsmain/src/gfs/util"
+	log "gfsmain/src/github.com/Sirupsen/logrus"
+	"github.com/sasha-s/go-deadlock"
 	"net"
 	"net/rpc"
 	"os"
-	"sync"
+	"path"
+	"strconv"
 	"time"
 )
 
@@ -33,7 +35,7 @@ type Mutation struct {
 }
 
 type chunkInfo struct {
-	sync.RWMutex
+	deadlock.RWMutex
 	length        gfs.Offset
 	version       gfs.ChunkVersion               // version number of the chunk in disk
 	newestVersion gfs.ChunkVersion               // allocated newest version number
@@ -114,6 +116,28 @@ func NewAndServe(addr, masterAddr gfs.ServerAddress, serverRoot string) *ChunkSe
 	return cs
 }
 
+//func (cs *ChunkServer) persist() {
+//	w := new(bytes.Buffer)
+//	e:=gob.NewEncoder(w)
+//	for handle, info := range cs.chunk {
+//		info.RLock()
+//		e.Encode(handle)
+//		e.Encode(info)
+//		info.RUnlock()
+//	}
+//}
+//
+//func (cs *ChunkServer) readPersist{
+//
+//}
+//
+//func (cs *ChunkServer) applyMutation{
+//	for handle, info := range cs.chunk {
+//		info.Lock()
+//		if info.mutations
+//	}
+//}
+
 // Shutdown shuts the chunkserver down
 func (cs *ChunkServer) Shutdown() {
 	if !cs.dead {
@@ -130,22 +154,39 @@ func (cs *ChunkServer) Shutdown() {
 func (cs *ChunkServer) RPCPushDataAndForward(args gfs.PushDataAndForwardArg, reply *gfs.PushDataAndForwardReply) error {
 	to, data, handle := args.ForwardTo, args.Data, args.Handle
 	dataID := cs.dl.New(handle)
+	util.ServerLogf(cs.address, "assign DataID:%v", dataID.TimeStamp)
 	cs.dl.Set(dataID, data)
-	var errorCode gfs.ErrorCode
-	for _, address := range to {
-		if address != cs.address {
-			forwardArg := gfs.ForwardDataArg{
-				DataID: dataID,
-				Data:   data,
+	if len(to) > 0 {
+		ch := make(chan gfs.ErrorCode, len(to)-1)
+		for _, address := range to {
+			address := address
+			go func(serverAddress gfs.ServerAddress) {
+				if address != cs.address {
+					{
+						forwardArg := gfs.ForwardDataArg{
+							DataID: dataID,
+							Data:   data,
+						}
+						forwardReply := new(gfs.ForwardDataReply)
+						util.ServerLogf(cs.address, "Send PushDataRPC to%s ID:%v", address, dataID.TimeStamp)
+						util.Call(address, "ChunkServer.RPCForwardData", forwardArg, forwardReply)
+						ch <- reply.ErrorCode
+					}
+				}
+			}(address)
+		}
+		cnt := 0
+		for code := range ch {
+			//util.ServerLogf(cs.address, "channel handle PushDataRPC")
+			if code != 0 {
+				reply.ErrorCode = code
 			}
-			forwardReply := new(gfs.ForwardDataReply)
-			util.Call(address, "ChunkServer.PRCForwardData", forwardArg, forwardReply)
-			if forwardReply.ErrorCode != 0 {
-				errorCode = forwardReply.ErrorCode
+			cnt += 1
+			if cnt == cap(ch) {
+				break
 			}
 		}
 	}
-	reply.ErrorCode = errorCode
 	reply.DataID = dataID
 	return nil
 }
@@ -153,6 +194,7 @@ func (cs *ChunkServer) RPCPushDataAndForward(args gfs.PushDataAndForwardArg, rep
 // RPCForwardData is called by another replica who sends data to the current memory buffer.
 // TODO: This should be replaced by a chain forwarding.
 func (cs *ChunkServer) RPCForwardData(args gfs.ForwardDataArg, reply *gfs.ForwardDataReply) error {
+	util.ServerLogf(cs.address, "Receive DataID %v", args.DataID.TimeStamp)
 	cs.dl.Set(args.DataID, args.Data)
 	reply.ErrorCode = 0
 	return nil
@@ -160,27 +202,48 @@ func (cs *ChunkServer) RPCForwardData(args gfs.ForwardDataArg, reply *gfs.Forwar
 
 // RPCCreateChunk is called by master to create a new chunk given the chunk handle.
 func (cs *ChunkServer) RPCCreateChunk(args gfs.CreateChunkArg, reply *gfs.CreateChunkReply) error {
+	util.ServerLogf(cs.address, "Create chunk %s", args.Handle)
 	_, ok := cs.chunk[args.Handle]
 	if ok {
 		reply.ErrorCode = 1
 		return nil
 	}
 	cs.chunk[args.Handle] = &chunkInfo{
-		RWMutex:       sync.RWMutex{},
+		RWMutex:       deadlock.RWMutex{},
 		length:        0,
 		version:       0,
 		newestVersion: 0,
 		mutations:     make(map[gfs.ChunkVersion]*Mutation),
 	}
-	os.Chdir(cs.serverRoot)
-	os.Create(string(args.Handle))
+	_, err := os.Create(path.Join(cs.serverRoot, strconv.FormatInt(int64(args.Handle), 10)))
+	if err != nil {
+		log.Fatal("chunk server cannot create chunk", err)
+	}
 	reply.ErrorCode = 0
 	return nil
 }
 
 // RPCReadChunk is called by client, read chunk data and return
 func (cs *ChunkServer) RPCReadChunk(args gfs.ReadChunkArg, reply *gfs.ReadChunkReply) error {
-
+	file, err := os.OpenFile(path.Join(cs.serverRoot, strconv.FormatInt(int64(args.Handle), 10)), os.O_RDWR, 0755)
+	if err != nil {
+		log.Fatal("chunk server cannot open file", err)
+	}
+	//siz := int(cs.chunk[args.Handle].length)
+	//if siz < args.Length {
+	//	siz = args.Length
+	//}
+	data := make([]byte, args.Length)
+	_, err = file.ReadAt(data, int64(args.Offset))
+	util.ServerLogf(cs.address, "read %v bytes of chunk %v at offset %v", args.Length, args.Handle, args.Offset)
+	file.Close()
+	if err != nil {
+		return err
+	}
+	reply.Length = args.Length
+	reply.Data = data
+	reply.ErrorCode = 0
+	return nil
 }
 
 // RPCWriteChunk is called by client
@@ -192,6 +255,7 @@ func (cs *ChunkServer) RPCWriteChunk(args gfs.WriteChunkArg, reply *gfs.WriteChu
 	handle := args.Handle
 	chunk := cs.chunk[handle]
 	data, ok := cs.dl.Get(dataID)
+	util.ServerLogf(cs.address, "write bytes of length %v at offset %v ID:%v", len(data), offset, dataID.TimeStamp)
 	if !ok {
 		return gfs.Error{
 			Code: 1,
@@ -201,36 +265,59 @@ func (cs *ChunkServer) RPCWriteChunk(args gfs.WriteChunkArg, reply *gfs.WriteChu
 	chunk.Lock()
 	defer chunk.Unlock()
 	chunk.newestVersion += 1
-	if len(data)+int(offset) > int(chunk.length) {
-		chunk.length = gfs.Offset(len(data) + int(offset))
-	}
 	chunk.mutations[chunk.newestVersion] = &Mutation{
 		mtype:   gfs.MutationWrite,
 		version: chunk.newestVersion,
 		data:    data,
 		offset:  offset,
 	}
-	os.Chdir(cs.serverRoot)
-	file, _ := os.Open(string(args.Handle))
-	file.WriteAt(data, int64(args.Offset))
+	file, err := os.OpenFile(path.Join(cs.serverRoot, strconv.FormatInt(int64(args.Handle), 10)), os.O_RDWR, 0755)
+	if err != nil {
+		log.Fatal("chunk server cannot open file ", err)
+	}
+	if offset > chunk.length {
+		pad := make([]byte, offset-chunk.length)
+		file.WriteAt(pad, int64(chunk.length))
+	}
+	_, err = file.WriteAt(data, int64(args.Offset))
+	if err != nil {
+		log.Fatal("chunk server cannot write file", err)
+	}
 	file.Close()
-	flag := true
-	for _, secondary := range secondaries {
-		writeArgs := gfs.WriteChunkArg{
-			Handle:      handle,
-			DataID:      dataID,
-			Offset:      offset,
-			Secondaries: make([]gfs.ServerAddress, 0),
+	if len(data)+int(offset) > int(chunk.length) {
+		chunk.length = gfs.Offset(len(data) + int(offset))
+	}
+	//util.ServerLogf(cs.address, "Done write for chunk %s ID:%v", args.Handle, args.DataID.TimeStamp)
+	if len(secondaries) != 0 {
+		ch := make(chan gfs.ErrorCode, len(secondaries))
+		for _, secondary := range secondaries {
+			secondary := secondary
+			go func(gfs.ServerAddress) {
+				writeArgs := gfs.WriteChunkArg{
+					Handle:      handle,
+					DataID:      dataID,
+					Offset:      offset,
+					Secondaries: make([]gfs.ServerAddress, 0),
+				}
+				writeReply := new(gfs.WriteChunkReply)
+				//todo uncertain error handle
+				util.ServerLogf(cs.address, "repost write to %v", secondary)
+				util.Call(secondary, "ChunkServer.RPCWriteChunk", writeArgs, writeReply)
+				ch <- writeReply.ErrorCode
+			}(secondary)
 		}
-		writeReply := new(gfs.WriteChunkReply)
-		util.Call(secondary, "ChunkServer.RPCWriteChunk", writeArgs, writeReply)
-		flag = flag && (writeReply.ErrorCode == 0)
+		cnt := 0
+		for err2 := range ch {
+			if err2 != 0 {
+				reply.ErrorCode = err2
+			}
+			cnt += 1
+			if cnt == cap(ch) {
+				break
+			}
+		}
 	}
-	if flag {
-		reply.ErrorCode = 0
-	} else {
-		reply.ErrorCode = 1
-	}
+	//println("damn")
 	return nil
 }
 
@@ -250,9 +337,9 @@ func (cs *ChunkServer) RPCAppendChunk(args gfs.AppendChunkArg, reply *gfs.Append
 			Err:  "CantFindDataWhenAppend",
 		}
 	}
+	util.ServerLogf(cs.address, "append bytes of len %v ID:%v", len(data), dataID.TimeStamp)
 	chunk := cs.chunk[args.Handle]
 	chunk.Lock()
-	defer chunk.Unlock()
 	if int(chunk.length)+len(data) > gfs.MaxChunkSize {
 		chunk.newestVersion += 1
 		chunk.mutations[chunk.newestVersion] = &Mutation{
@@ -274,48 +361,78 @@ func (cs *ChunkServer) RPCAppendChunk(args gfs.AppendChunkArg, reply *gfs.Append
 		data:    data,
 		offset:  reply.Offset,
 	}
-	chunk.length = gfs.Offset(len(data)) + chunk.length
-	flag := true
-	for _, secondary := range secondaries {
-		writeArgs := gfs.AppendChunkArg{
-			Handle:      handle,
-			DataID:      dataID,
-			Secondaries: make([]gfs.ServerAddress, 0),
-		}
-		writeReply := new(gfs.AppendChunkReply)
-		util.Call(secondary, "ChunkServer.RPCAppendChunk", writeArgs, writeReply)
-		flag = flag && (writeReply.ErrorCode == 0)
+	file, err := os.OpenFile(path.Join(cs.serverRoot, strconv.FormatInt(int64(args.Handle), 10)), os.O_RDWR, 0755)
+	if err != nil {
+		log.Fatal("chunk server cannot open file ", err)
 	}
-	if flag {
-		reply.ErrorCode = 0
-	} else {
-		reply.ErrorCode = 1
+	_, err = file.WriteAt(data, int64(chunk.length))
+	if err != nil {
+		log.Fatal("chunk server cannot append file", err)
+	}
+	file.Close()
+	chunk.length = gfs.Offset(len(data)) + chunk.length
+	chunk.Unlock()
+	if len(secondaries) != 0 {
+		ch := make(chan gfs.ErrorCode, len(secondaries))
+		for _, secondary := range secondaries {
+			if secondary == cs.address {
+				log.Panic("identical")
+			}
+			appendArgs := gfs.AppendChunkArg{
+				Handle:      handle,
+				DataID:      dataID,
+				Secondaries: make([]gfs.ServerAddress, 0),
+			}
+			appendReply := new(gfs.AppendChunkReply)
+			util.ServerLogf(cs.address, "repost append to %v", secondary)
+			err := util.Call(secondary, "ChunkServer.RPCAppendChunk", appendArgs, appendReply)
+			if err != nil {
+				return err
+			}
+			ch <- reply.ErrorCode
+		}
+		cnt := 0
+		for err := range ch {
+			if err != 0 {
+				reply.ErrorCode = err
+			}
+			cnt += 1
+			if cnt == cap(ch) {
+				break
+			}
+		}
 	}
 	return nil
 }
 
-// RPCApplyMutation is called by primary to apply mutations
-func (cs *ChunkServer) RPCApplyMutation(args gfs.ApplyMutationArg, reply *gfs.ApplyMutationReply) error {
-
-}
+//// RPCApplyMutation is called by primary to apply mutations
+//func (cs *ChunkServer) RPCApplyMutation(args gfs.ApplyMutationArg, reply *gfs.ApplyMutationReply) error {
+//
+//}
 
 // RPCSendCopy is called by master, send the whole copy to given address
 func (cs *ChunkServer) RPCSendCopy(args gfs.SendCopyArg, reply *gfs.SendCopyReply) error {
 	chunk := cs.chunk[args.Handle]
 	chunk.RLock()
 	defer chunk.RUnlock()
-	os.Chdir(cs.serverRoot)
-	file, _ := os.Open(string(args.Handle))
-	data := make([]byte, gfs.MaxChunkSize)
-	file.Read(data)
+	file, err := os.OpenFile(path.Join(cs.serverRoot, strconv.FormatInt(int64(args.Handle), 10)), os.O_RDWR, 0755)
+	if err != nil {
+		log.Fatal("chunk server cannot open file", err)
+	}
+	data := make([]byte, chunk.length)
+	_, err = file.ReadAt(data, 0)
+	if err != nil {
+		return err
+	}
 	file.Close()
 	applyArgs := gfs.ApplyCopyArg{
-		Handle:  0,
+		Handle:  args.Handle,
 		Data:    data,
 		Version: chunk.version,
 	}
 	applyReply := new(gfs.ApplyCopyReply)
-	err := util.Call(args.Address, "ChunkServer.RPCApplyCopy", applyArgs, applyReply)
+	util.ServerLogf(cs.address, "forward chunk %v to server %v", args.Handle, args.Address)
+	err = util.Call(args.Address, "ChunkServer.RPCApplyCopy", applyArgs, applyReply)
 	if err != nil {
 		reply.ErrorCode = 1
 	} else {
@@ -327,13 +444,32 @@ func (cs *ChunkServer) RPCSendCopy(args gfs.SendCopyArg, reply *gfs.SendCopyRepl
 // RPCApplyCopy is called by another replica
 // rewrite the local version to given copy data
 func (cs *ChunkServer) RPCApplyCopy(args gfs.ApplyCopyArg, reply *gfs.ApplyCopyReply) error {
+	cs.chunk[args.Handle] = &chunkInfo{
+		length:        0,
+		version:       0,
+		newestVersion: 0,
+		mutations:     make(map[gfs.ChunkVersion]*Mutation),
+	}
+	util.ServerLogf(cs.address, "apply replica of chunk %v", args.Handle)
 	chunk := cs.chunk[args.Handle]
 	chunk.Lock()
 	defer chunk.Unlock()
 	chunk.version = args.Version
-	os.Chdir(cs.serverRoot)
-	file, _ := os.Open(string(args.Handle))
-	file.WriteAt(args.Data, 0)
+	chunk.newestVersion = args.Version
+	chunk.length = gfs.Offset(len(args.Data))
+	os.Remove(path.Join(cs.serverRoot, strconv.FormatInt(int64(args.Handle), 10)))
+	_, err := os.Create(path.Join(cs.serverRoot, strconv.FormatInt(int64(args.Handle), 10)))
+	if err != nil {
+		log.Fatal("chunk server cannot create file ", err)
+	}
+	file, err := os.OpenFile(path.Join(cs.serverRoot, strconv.FormatInt(int64(args.Handle), 10)), os.O_RDWR, 0755)
+	if err != nil {
+		log.Fatal("chunk server cannot open file ", err)
+	}
+	_, err = file.WriteAt(args.Data, 0)
+	if err != nil {
+		log.Fatal("chunk server cannot write file ", err)
+	}
 	file.Close()
 	reply.ErrorCode = 0
 	return nil

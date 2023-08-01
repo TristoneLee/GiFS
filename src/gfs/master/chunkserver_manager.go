@@ -1,22 +1,27 @@
 package master
 
 import (
-	"main/src/gfs"
-	"sync"
+	"container/ring"
+	"gfsmain/src/gfs"
+	"gfsmain/src/gfs/util"
+	log "gfsmain/src/github.com/Sirupsen/logrus"
+	"github.com/sasha-s/go-deadlock"
 	"time"
 )
 
 // chunkServerManager manages chunkservers
 type chunkServerManager struct {
-	sync.RWMutex
-	servers    map[gfs.ServerAddress]*chunkServerInfo
-	serversCnt map[gfs.ServerAddress]int
+	deadlock.RWMutex
+	servers map[gfs.ServerAddress]*chunkServerInfo
+	//serversCnt map[gfs.ServerAddress]int
+	serverRing *ring.Ring
 }
 
 func newChunkServerManager() *chunkServerManager {
 	csm := &chunkServerManager{
 		servers:    make(map[gfs.ServerAddress]*chunkServerInfo),
-		serversCnt: make(map[gfs.ServerAddress]int),
+		serverRing: nil,
+		//serversCnt: make(map[gfs.ServerAddress]int),
 	}
 	return csm
 }
@@ -31,17 +36,44 @@ type chunkServerInfo struct {
 func (csm *chunkServerManager) Heartbeat(addr gfs.ServerAddress) {
 	csm.Lock()
 	defer csm.Unlock()
-	csm.servers[addr].lastHeartbeat = time.Now()
+	serverInfo, ok := csm.servers[addr]
+	if !ok {
+		csm.servers[addr] = &chunkServerInfo{
+			lastHeartbeat: time.Now(),
+			chunks:        make([]gfs.ChunkHandle, 0),
+		}
+		//csm.serversCnt[addr]=0;
+		newRing := ring.New(1)
+		newRing.Value = addr
+		if csm.serverRing != nil {
+			csm.serverRing.Link(newRing)
+		} else {
+			csm.serverRing = newRing
+		}
+		util.MasterLogf("Register Server:%s", addr)
+	} else {
+		serverInfo.lastHeartbeat = time.Now()
+	}
 }
 
 // AddChunk creates a chunk on given chunkservers
-func (csm *chunkServerManager) AddChunk(addrs []gfs.ServerAddress, handle gfs.ChunkHandle) error {
+func (csm *chunkServerManager) AddChunk(addr gfs.ServerAddress, handle gfs.ChunkHandle) {
 	csm.Lock()
 	defer csm.Unlock()
-	for _, addr := range addrs {
-		csm.servers[addr].chunks = append(csm.servers[addr].chunks, handle)
+	serverInfo, ok := csm.servers[addr]
+	if !ok {
+		csm.servers[addr] = &chunkServerInfo{
+			lastHeartbeat: time.Now(),
+			chunks:        make([]gfs.ChunkHandle, 1),
+		}
+		csm.servers[addr].chunks[0] = handle
+		log.Warn("UnexpectedInAddChunk")
+		//csm.serversCnt[addr]+=1
+	} else {
+		serverInfo.chunks = append(serverInfo.chunks, handle)
+		//csm.serversCnt[addr]+=1
 	}
-	return nil
+
 }
 
 // ChooseReReplication chooses servers to perform re-replication
@@ -75,25 +107,19 @@ func (csm *chunkServerManager) ChooseReReplication(handle gfs.ChunkHandle) (from
 
 // ChooseServers returns servers to store new chunk.
 // It is called when a new chunk is create
-func (csm *chunkServerManager) ChooseServers(num int) ([]gfs.ServerAddress, error) {
+func (csm *chunkServerManager) ChooseServers(num int) []gfs.ServerAddress {
 	csm.Lock()
 	defer csm.Unlock()
 	ret := make([]gfs.ServerAddress, num)
 	for i := 0; i < num; i = i + 1 {
 		ret[i] = csm.chooseServer()
 	}
-	return ret, nil
+	return ret
 }
 
 func (csm *chunkServerManager) chooseServer() (addr gfs.ServerAddress) {
-	maxCnt := 1 << 31
-	for address, cnt := range csm.serversCnt {
-		if cnt < maxCnt {
-			maxCnt = cnt
-			addr = address
-		}
-	}
-	csm.serversCnt[addr] += 1
+	addr = csm.serverRing.Value.(gfs.ServerAddress)
+	csm.serverRing = csm.serverRing.Next()
 	return addr
 }
 
@@ -113,12 +139,46 @@ func (csm *chunkServerManager) DetectDeadServers() []gfs.ServerAddress {
 // RemoveServers removes metedata of a disconnected chunkserver.
 // It returns the chunks that server holds
 func (csm *chunkServerManager) RemoveServer(addr gfs.ServerAddress) ([]gfs.ChunkHandle, error) {
-	handles, ok := csm.servers[addr]
+	info, ok := csm.servers[addr]
+	util.MasterLogf("server %v holds replicas of %v when offline", addr, info.chunks)
+	handles := make([]gfs.ChunkHandle, len(info.chunks))
+	copy(handles, info.chunks)
 	if !ok {
 		return nil, gfs.Error{
 			Code: 1,
 			Err:  "InvalidServerAddress",
 		}
 	}
-	return handles.chunks, nil
+	delete(csm.servers, addr)
+	for i := 0; i < csm.serverRing.Len(); i = i + 1 {
+		if csm.serverRing.Move(i).Value.(gfs.ServerAddress).String() == addr.String() {
+			if i == 0 {
+				csm.serverRing = csm.serverRing.Next()
+				csm.serverRing.Move(-2).Unlink(1)
+			} else {
+				csm.serverRing.Move(i - 1).Unlink(1)
+			}
+		}
+	}
+	return handles, nil
+}
+
+func (csm *chunkServerManager) ReallocateChunk(handle gfs.ChunkHandle, replicas []gfs.ServerAddress) gfs.ServerAddress {
+	csm.Lock()
+	var server gfs.ServerAddress
+	flag := true
+	for flag {
+		server = csm.chooseServer()
+		flag = func() bool {
+			for _, replica := range replicas {
+				if replica == server {
+					return true
+				}
+			}
+			return false
+		}()
+	}
+	csm.Unlock()
+	csm.AddChunk(server, handle)
+	return server
 }

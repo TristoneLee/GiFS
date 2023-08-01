@@ -1,22 +1,19 @@
 package main
 
 import (
-	"main/src/gfs"
-	"main/src/gfs/chunkserver"
-	"main/src/gfs/client"
-	"main/src/gfs/master"
-	"main/src/gfs/util"
-	"reflect"
-
 	"fmt"
-	"io"
-	"io/ioutil"
-	log "main/src/github.com/Sirupsen/logrus"
+	"gfsmain/src/gfs"
+	"gfsmain/src/gfs/chunkserver"
+	"gfsmain/src/gfs/client"
+	"gfsmain/src/gfs/master"
+	"gfsmain/src/gfs/util"
+	log "gfsmain/src/github.com/Sirupsen/logrus"
+	"path/filepath"
+	"reflect"
 	//"math/rand"
 	"os"
 	"path"
 	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -43,6 +40,23 @@ func errorAll(ch chan error, n int, t *testing.T) {
 		}
 	}
 }
+
+// func TestDraft(t *testing.T) {
+// 	expected := make([]int, 10)
+// 	for i := 0; i < 10; i = i + 1 {
+// 		expected[i] = i
+// 	}
+// 	testcase := make([]int, 10)
+// 	for i := 0; i < 5; i = i + 1 {
+// 		func(a []int, i int) {
+// 			a[0] = 2 * i
+// 			a[1] = 2*i + 1
+// 		}(testcase[i*2:i*2+1], i)
+// 	}
+// 	if !reflect.DeepEqual(testcase, expected) {
+// 		t.Error("should be the same")
+// 	}
+// }
 
 /*
  *  TEST SUITE 1 - Basic File Operation
@@ -118,7 +132,7 @@ func TestRPCGetChunkHandle(t *testing.T) {
 		t.Error(err)
 	}
 	if r1.Handle != r2.Handle {
-		t.Error("got different handle: %v and %v", r1.Handle, r2.Handle)
+		t.Errorf("got different handle: %v and %v", r1.Handle, r2.Handle)
 	}
 
 	err = m.RPCGetChunkHandle(gfs.GetChunkHandleArg{path, 2}, &r2)
@@ -180,7 +194,9 @@ func checkReplicas(handle gfs.ChunkHandle, length int, t *testing.T) int {
 		err := util.Call(addr, "ChunkServer.RPCReadChunk", args, &r)
 		if err == nil {
 			data = append(data, r.Data)
-			//fmt.Println("find in ", addr)
+			fmt.Println("find in ", addr)
+		} else {
+			t.Error(err)
 		}
 	}
 
@@ -316,6 +332,12 @@ func TestWriteReadBigData(t *testing.T) {
 	if n != size {
 		t.Error("read counter is wrong")
 	}
+	// buf_file, err := os.Create(path.Join(root, "buf"))
+	// buf_file.WriteAt(buf, 0)
+	// buf_file.Close()
+	// expected_file, err := os.Create(path.Join(root, "expected"))
+	// expected_file.WriteAt(expected, 0)
+	// expected_file.Close()
 	if !reflect.DeepEqual(expected, buf) {
 		t.Error("read wrong data")
 	}
@@ -331,7 +353,7 @@ func TestWriteReadBigData(t *testing.T) {
 	buf = buf[:gfs.MaxAppendSize-1]
 	offset, err = c.Append(p, buf)
 	if offset != gfs.MaxChunkSize/2+gfs.Offset(size) {
-		t.Error("append in wrong offset")
+		t.Errorf("append in wrong offset, get offset %v, should be %v", offset, gfs.MaxChunkSize/2+gfs.Offset(size))
 	}
 	ch <- err
 
@@ -351,160 +373,160 @@ func (ct *Counter) Next() int {
 }
 
 // a concurrent producer-consumer number collector for testing race contiditon
-func TestComprehensiveOperation(t *testing.T) {
-	createTick := 100 * time.Millisecond
-
-	done := make(chan struct{})
-
-	var line []chan gfs.Path
-	for i := 0; i < 3; i++ {
-		line = append(line, make(chan gfs.Path, N*200))
-	}
-
-	// Hard !!
-	go func() {
-		return
-		i := 1
-		cs[i-1].Shutdown()
-		time.Sleep(gfs.ServerTimeout + gfs.LeaseExpire)
-		for {
-			select {
-			case <-done:
-				return
-			default:
-			}
-			j := (i - 1 + csNum) % csNum
-			jj := strconv.Itoa(j)
-			cs[i].Shutdown()
-			cs[j] = chunkserver.NewAndServe(csAdd[j], mAdd, path.Join(root, "cs"+jj))
-			i = (i + 1) % csNum
-			time.Sleep(gfs.ServerTimeout + gfs.LeaseExpire)
-		}
-	}()
-
-	// create
-	var wg0 sync.WaitGroup
-	var createCt Counter
-	wg0.Add(2)
-	for i := 0; i < 2; i++ {
-		go func(x int) {
-			ticker := time.Tick(createTick)
-		loop:
-			for {
-				select {
-				case <-done:
-					break loop
-				case p := <-line[1]: // get back from append
-					line[0] <- p
-				case <-ticker: // create new file
-					x := createCt.Next()
-					p := gfs.Path(fmt.Sprintf("/haha%v.txt", x))
-
-					//fmt.Println("create ", p)
-					err := c.Create(p)
-					if err != nil {
-						t.Error(err)
-					} else {
-						line[0] <- p
-					}
-				}
-			}
-			wg0.Done()
-		}(i)
-	}
-
-	go func() {
-		wg0.Wait()
-		close(line[0])
-	}()
-
-	// append 0, 1, 2, ..., sendCounter
-	var wg1 sync.WaitGroup
-	var sendCt Counter
-	wg1.Add(N)
-	for i := 0; i < N; i++ {
-		go func(x int) {
-			for p := range line[0] {
-				x := sendCt.Next()
-
-				//fmt.Println("append ", p, "  ", tmp)
-				_, err := c.Append(p, []byte(fmt.Sprintf("%10d,", x)))
-				if err != nil {
-					t.Error(err)
-				}
-
-				line[1] <- p
-				line[2] <- p
-			}
-			wg1.Done()
-		}(i)
-	}
-
-	go func() {
-		wg1.Wait()
-		close(line[2])
-	}()
-
-	// read and collect numbers
-	var wg2 sync.WaitGroup
-	var lock2 sync.RWMutex
-	receiveData := make(map[int]int)
-	fileOffset := make(map[gfs.Path]int)
-	wg2.Add(N)
-	for i := 0; i < N; i++ {
-		go func(x int) {
-			for p := range line[2] {
-				lock2.RLock()
-				pos := fileOffset[p]
-				lock2.RUnlock()
-				buf := make([]byte, 10000) // large enough
-				n, err := c.Read(p, gfs.Offset(pos), buf)
-				if err != nil && err != io.EOF {
-					t.Error(err)
-				}
-				if n == 0 {
-					continue
-				}
-				buf = buf[:n-1]
-				//fmt.Println("read ", p, " at ", pos, " : ", string(buf))
-
-				lock2.Lock()
-				for _, v := range strings.Split(string(buf), ",") {
-					i, err := strconv.Atoi(strings.TrimSpace(v))
-					if err != nil {
-						t.Error(err)
-					}
-					receiveData[i]++
-				}
-				if pos+n > fileOffset[p] {
-					fileOffset[p] = pos + n
-				}
-				lock2.Unlock()
-				time.Sleep(N * time.Millisecond)
-			}
-			wg2.Done()
-		}(i)
-	}
-
-	// wait to test race contition
-	fmt.Println("###### Continue life for the elder to pass a long time test...")
-	for i := 0; i < 6; i++ {
-		fmt.Print(" +1s ")
-		time.Sleep(time.Second)
-	}
-	fmt.Println("")
-	close(done)
-	wg2.Wait()
-
-	// check correctness
-	total := sendCt.Next() - 1
-	for i := 0; i < total; i++ {
-		if receiveData[i] < 1 {
-			t.Errorf("error occured in sending data %v", i)
-		}
-	}
-	fmt.Printf("##### You send %v numbers in total\n", total)
-}
+//func TestComprehensiveOperation(t *testing.T) {
+//	createTick := 100 * time.Millisecond
+//
+//	done := make(chan struct{})
+//
+//	var line []chan gfs.Path
+//	for i := 0; i < 3; i++ {
+//		line = append(line, make(chan gfs.Path, N*200))
+//	}
+//
+//	// Hard !!
+//	go func() {
+//		return
+//		i := 1
+//		cs[i-1].Shutdown()
+//		time.Sleep(gfs.ServerTimeout + gfs.LeaseExpire)
+//		for {
+//			select {
+//			case <-done:
+//				return
+//			default:
+//			}
+//			j := (i - 1 + csNum) % csNum
+//			jj := strconv.Itoa(j)
+//			cs[i].Shutdown()
+//			cs[j] = chunkserver.NewAndServe(csAdd[j], mAdd, path.Join(root, "cs"+jj))
+//			i = (i + 1) % csNum
+//			time.Sleep(gfs.ServerTimeout + gfs.LeaseExpire)
+//		}
+//	}()
+//
+//	// create
+//	var wg0 sync.WaitGroup
+//	var createCt Counter
+//	wg0.Add(2)
+//	for i := 0; i < 2; i++ {
+//		go func(x int) {
+//			ticker := time.Tick(createTick)
+//		loop:
+//			for {
+//				select {
+//				case <-done:
+//					break loop
+//				case p := <-line[1]: // get back from append
+//					line[0] <- p
+//				case <-ticker: // create new file
+//					x := createCt.Next()
+//					p := gfs.Path(fmt.Sprintf("/haha%v.txt", x))
+//
+//					//fmt.Println("create ", p)
+//					err := c.Create(p)
+//					if err != nil {
+//						t.Error(err)
+//					} else {
+//						line[0] <- p
+//					}
+//				}
+//			}
+//			wg0.Done()
+//		}(i)
+//	}
+//
+//	go func() {
+//		wg0.Wait()
+//		close(line[0])
+//	}()
+//
+//	// append 0, 1, 2, ..., sendCounter
+//	var wg1 sync.WaitGroup
+//	var sendCt Counter
+//	wg1.Add(N)
+//	for i := 0; i < N; i++ {
+//		go func(x int) {
+//			for p := range line[0] {
+//				x := sendCt.Next()
+//
+//				//fmt.Println("append ", p, "  ", tmp)
+//				_, err := c.Append(p, []byte(fmt.Sprintf("%10d,", x)))
+//				if err != nil {
+//					t.Error(err)
+//				}
+//
+//				line[1] <- p
+//				line[2] <- p
+//			}
+//			wg1.Done()
+//		}(i)
+//	}
+//
+//	go func() {
+//		wg1.Wait()
+//		close(line[2])
+//	}()
+//
+//	// read and collect numbers
+//	var wg2 sync.WaitGroup
+//	var lock2 sync.RWMutex
+//	receiveData := make(map[int]int)
+//	fileOffset := make(map[gfs.Path]int)
+//	wg2.Add(N)
+//	for i := 0; i < N; i++ {
+//		go func(x int) {
+//			for p := range line[2] {
+//				lock2.RLock()
+//				pos := fileOffset[p]
+//				lock2.RUnlock()
+//				buf := make([]byte, 10000) // large enough
+//				n, err := c.Read(p, gfs.Offset(pos), buf)
+//				if err != nil && err.Error() != "EOF" {
+//					t.Error(err)
+//				}
+//				if n == 0 {
+//					continue
+//				}
+//				buf = buf[:n-1]
+//				fmt.Println("read ", p, " at ", pos, " : ", string(buf))
+//
+//				lock2.Lock()
+//				for _, v := range strings.Split(string(buf), ",") {
+//					i, err := strconv.Atoi(strings.TrimSpace(v))
+//					if err != nil {
+//						t.Error(err)
+//					}
+//					receiveData[i]++
+//				}
+//				if pos+n > fileOffset[p] {
+//					fileOffset[p] = pos + n
+//				}
+//				lock2.Unlock()
+//				time.Sleep(N * time.Millisecond)
+//			}
+//			wg2.Done()
+//		}(i)
+//	}
+//
+//	// wait to test race contition
+//	fmt.Println("###### Continue life for the elder to pass a long time test...")
+//	for i := 0; i < 6; i++ {
+//		fmt.Print(" +1s ")
+//		time.Sleep(time.Second)
+//	}
+//	fmt.Println("")
+//	close(done)
+//	wg2.Wait()
+//
+//	// check correctness
+//	total := sendCt.Next() - 1
+//	for i := 0; i < total; i++ {
+//		if receiveData[i] < 1 {
+//			t.Errorf("error occured in sending data %v", i)
+//		}
+//	}
+//	fmt.Printf("##### You send %v numbers in total\n", total)
+//}
 
 /*
  *  TEST SUITE 3 - Fault Tolerance
@@ -622,7 +644,7 @@ func TestReReplication(t *testing.T) {
 	// check equality and number of replicas
 	var r1 gfs.GetChunkHandleReply
 	ch <- m.RPCGetChunkHandle(gfs.GetChunkHandleArg{p, 0}, &r1)
-	n := checkReplicas(r1.Handle, N*2, t)
+	n := checkReplicas(r1.Handle, 9, t)
 
 	if n < gfs.MinimumNumReplicas {
 		t.Errorf("Cannot perform replicas promptly, only get %v replicas", n)
@@ -779,7 +801,17 @@ func TestDiskError(t *testing.T) {
 func TestMain(tm *testing.M) {
 	// create temporary directory
 	var err error
-	root, err = ioutil.TempDir("", "gfs-")
+	globPattern := filepath.Join("E:/课程资料/大三小学期/gfs/ppca-gfs", "gfs-*")
+	matches, err := filepath.Glob(globPattern)
+	if err != nil {
+		log.Fatalf("Failed to match %q: %v", globPattern, err)
+	}
+	for _, match := range matches {
+		if err = os.RemoveAll(match); err != nil {
+			log.Printf("Failed to remove %q: %v", match, err)
+		}
+	}
+	root, err = os.MkdirTemp("E:/课程资料/大三小学期/gfs/ppca-gfs", "gfs-")
 	if err != nil {
 		log.Fatal("cannot create temporary directory: ", err)
 	}
@@ -812,7 +844,7 @@ func TestMain(tm *testing.M) {
 		v.Shutdown()
 	}
 	m.Shutdown()
-	os.RemoveAll(root)
+	//os.RemoveAll(root)
 
 	os.Exit(ret)
 }

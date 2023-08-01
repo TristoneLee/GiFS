@@ -1,9 +1,9 @@
 package util
 
 import (
-	"main/src/gfs"
+	"gfsmain/src/gfs"
+	"github.com/sasha-s/go-deadlock"
 	"math/rand"
-	"sync"
 )
 
 // ArraySet is a set implemented using array. I suppose it'll provide better
@@ -11,7 +11,7 @@ import (
 // It is thread-safe since a mutex is used.
 type ArraySet struct {
 	arr  []interface{}
-	lock sync.RWMutex
+	lock deadlock.RWMutex
 }
 
 // Add adds an element to the set.
@@ -28,7 +28,7 @@ func (s *ArraySet) Add(element interface{}) {
 
 func (s *ArraySet) copy() *ArraySet {
 	ret := new(ArraySet)
-	ret.arr = make([]interface{}, 0)
+	ret.arr = make([]interface{}, len(s.arr))
 	copy(ret.arr, s.arr)
 	return ret
 }
@@ -38,7 +38,9 @@ func (s *ArraySet) Copy() *ArraySet {
 	defer s.lock.Unlock()
 	ret := new(ArraySet)
 	ret.arr = make([]interface{}, 0)
-	copy(ret.arr, s.arr)
+	for _, i := range s.arr {
+		ret.arr = append(ret.arr, i)
+	}
 	return ret
 }
 

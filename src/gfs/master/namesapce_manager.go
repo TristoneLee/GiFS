@@ -1,10 +1,10 @@
 package master
 
 import (
-	"main/src/gfs"
-	log "main/src/github.com/Sirupsen/logrus"
+	"gfsmain/src/gfs"
+	log "gfsmain/src/github.com/Sirupsen/logrus"
+	"github.com/sasha-s/go-deadlock"
 	"strings"
-	"sync"
 )
 
 type namespaceManager struct {
@@ -12,7 +12,7 @@ type namespaceManager struct {
 }
 
 type nsTree struct {
-	sync.RWMutex
+	deadlock.RWMutex
 
 	// if it is a directory
 	isDir    bool
@@ -34,11 +34,11 @@ func newNamespaceManager() *namespaceManager {
 // Create creates an empty file on path p. All parents should exist.
 func (nm *namespaceManager) Create(p gfs.Path) error {
 	pArgs := strings.Split(string(p), "/")
-	nm.innerCreate(nm.root, pArgs)
-	return nil
+	pArgs = pArgs[1:]
+	return nm.innerCreate(nm.root, pArgs)
 }
 
-func (nm *namespaceManager) innerCreate(dir *nsTree, pArgs []string) {
+func (nm *namespaceManager) innerCreate(dir *nsTree, pArgs []string) error {
 	dir.RLock()
 	defer dir.RWMutex.RUnlock()
 	arg := pArgs[0]
@@ -46,44 +46,62 @@ func (nm *namespaceManager) innerCreate(dir *nsTree, pArgs []string) {
 	nxtDir, ok := dir.children[arg]
 	if len(pArgs) == 0 {
 		if ok {
-			log.Warn("Double create file")
+			log.Error("Double create file")
+			return gfs.Error{
+				Code: 1,
+				Err:  "DoubleCreateFile",
+			}
 		} else {
 			dir.children[arg] = &nsTree{isDir: false}
+			return nil
 		}
-		return
 	} else {
 		if !ok {
 			dir.children[arg] = &nsTree{isDir: true, children: make(map[string]*nsTree)}
 			nxtDir = dir.children[arg]
 		}
-		nm.innerCreate(nxtDir, pArgs)
+		return nm.innerCreate(nxtDir, pArgs)
 	}
 }
 
 // Mkdir creates a directory on path p. All parents should exist.
 func (nm *namespaceManager) Mkdir(p gfs.Path) error {
 	pArgs := strings.Split(string(p), "/")
-	nm.innerMkdir(nm.root, pArgs)
-	return nil
+	pArgs = pArgs[1:]
+	return nm.innerMkdir(nm.root, pArgs)
 }
 
-func (nm *namespaceManager) innerMkdir(dir *nsTree, pArgs []string) {
+func (nm *namespaceManager) innerMkdir(dir *nsTree, pArgs []string) error {
 	dir.RLock()
 	defer dir.RWMutex.RUnlock()
 	arg := pArgs[0]
 	pArgs = pArgs[1:]
 	nxtDir, ok := dir.children[arg]
-	if !ok {
-		dir.children[arg] = &nsTree{isDir: true, children: make(map[string]*nsTree)}
-		nxtDir = dir.children[arg]
-	}
-	if len(pArgs) != 0 {
-		nm.innerMkdir(nxtDir, pArgs)
+	if len(pArgs) == 0 {
+		if ok {
+			log.Error("Double mkdir")
+			return gfs.Error{
+				Code: 1,
+				Err:  "DoubleMkdir",
+			}
+		} else {
+			dir.children[arg] = &nsTree{isDir: true, children: make(map[string]*nsTree)}
+			return nil
+		}
+	} else {
+		if !ok {
+			dir.children[arg] = &nsTree{isDir: true, children: make(map[string]*nsTree)}
+			nxtDir = dir.children[arg]
+		}
+		return nm.innerMkdir(nxtDir, pArgs)
 	}
 }
 
 func (nm *namespaceManager) QueryDir(p gfs.Path) (files []gfs.PathInfo, err error) {
 	pArgs := strings.Split(string(p), "/")
+	for len(pArgs) != 0 && pArgs[0] == "" {
+		pArgs = pArgs[1:]
+	}
 	ptr := nm.root
 	for _, arg := range pArgs {
 		ptr.RLock()

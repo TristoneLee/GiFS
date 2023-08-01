@@ -1,13 +1,13 @@
 package master
 
 import (
-	"main/src/gfs/util"
-	log "main/src/github.com/Sirupsen/logrus"
+	"gfsmain/src/gfs/util"
+	log "gfsmain/src/github.com/Sirupsen/logrus"
 	"net"
 	"net/rpc"
 	"time"
 
-	"main/src/gfs"
+	"gfsmain/src/gfs"
 )
 
 // Master Server struct
@@ -95,19 +95,52 @@ func (m *Master) Shutdown() {
 // BackgroundActivity does all the background activities:
 // dead chunkserver handling, garbage collection, stale replica detection, etc
 func (m *Master) BackgroundActivity() error {
+	go m.DeadChunkServerHandling()
+	go m.RefillReplica()
 	return nil
+}
+
+func (m *Master) DeadChunkServerHandling() {
+	deadServers := m.csm.DetectDeadServers()
+	for _, server := range deadServers {
+		util.MasterLogf("chunkserver %v is detected to be dead", server)
+		handles, err := m.csm.RemoveServer(server)
+		if err != nil {
+			log.Fatal(err)
+		}
+		for _, handle := range handles {
+			m.cm.RemoveReplica(handle, server)
+		}
+	}
+}
+
+func (m *Master) RefillReplica() {
+	handles := m.cm.DetectInadequateReplica()
+	for _, handle := range handles {
+		handle := handle
+		go func() {
+			replicas, _ := m.cm.GetReplicas(handle)
+			addr := m.csm.ReallocateChunk(handle, replicas.CastAllToServerAddress())
+			err := m.cm.ReallocateReplica(handle, addr)
+			if err != nil {
+				log.Warningf("error occur in reallocating replica %v, %v", handle, err)
+				m.cm.AddHistory(handle)
+			}
+		}()
+	}
+}
+
+func (m *Master) Backup() {
+
 }
 
 // RPCHeartbeat is called by chunkserver to let the master know that a chunkserver is alive.
 // Lease extension request is included.
 func (m *Master) RPCHeartbeat(args gfs.HeartbeatArg, reply *gfs.HeartbeatReply) error {
+	//util.MasterLogf("Receive Heartbeat from ChunkServer:%s", args.Address)
 	m.csm.Heartbeat(args.Address)
-	for _, handle := range args.LeaseExtensions {
-		err := m.cm.ExtendLease(handle, args.Address)
-		if err != nil {
-			return err
-		}
-	}
+	go m.cm.ExtendLease(args.LeaseExtensions, args.Address)
+	//util.MasterLogf("heartbeat of %v", args.Address)
 	return nil
 }
 
@@ -136,41 +169,46 @@ func (m *Master) RPCGetReplicas(args gfs.GetReplicasArg, reply *gfs.GetReplicasR
 
 // RPCCreateFile is called by client to create a new file
 func (m *Master) RPCCreateFile(args gfs.CreateFileArg, reply *gfs.CreateFileReply) error {
+	util.MasterLogf("Create file {%s}", args.Path)
 	err := m.nm.Create(args.Path)
 	if err != nil {
 		return err
 	}
-	servers, err := m.csm.ChooseServers(gfs.DefaultNumReplicas)
-	if err != nil {
-		return err
-	}
-	handle, err := m.cm.CreateChunk(args.Path, servers)
-	if err != nil {
-		return err
-	}
+	err, _ = m.createChunk(args.Path)
+	return err
+}
+
+func (m *Master) createChunk(path gfs.Path) (error, gfs.ChunkHandle) {
+	servers := m.csm.ChooseServers(gfs.DefaultNumReplicas)
+	handle := gfs.NewHandle()
+	m.cm.RegisterChunk(path, handle)
+	util.MasterLogf("Send CreateChunkPRC to %s, %s, %s", servers[0], servers[1], servers[2])
 	for _, server := range servers {
 		go func(server gfs.ServerAddress, handle gfs.ChunkHandle) {
-			cnt := 0
-			for {
-				cnt += 1
-				createArgs := gfs.CreateChunkArg{Handle: handle}
-				createReply := new(gfs.CreateChunkReply)
-				util.Call(server, "ChunkServer.CreateChunk", createArgs, createReply)
-				if createReply.ErrorCode == 0 {
-					break
+			createArgs := gfs.CreateChunkArg{Handle: handle}
+			createReply := new(gfs.CreateChunkReply)
+			util.Call(server, "ChunkServer.RPCCreateChunk", createArgs, createReply)
+			if createReply.ErrorCode == 0 {
+				util.MasterLogf("Success in create chunk %s in server %s", handle, server)
+				m.csm.AddChunk(server, handle)
+				err := m.cm.ReplicateChunk(server, handle)
+				if err != nil {
+					return
 				}
-			}
-			if cnt > 10 {
-				log.Fatal("Unexpected failure in chunk ", handle, "create for ", server)
+				return
+			} else {
+				println("damn")
+				m.cm.AddHistory(handle)
 			}
 		}(server, handle)
-
 	}
-	return nil
+	time.Sleep(10 * time.Millisecond)
+	return nil, handle
 }
 
 // RPCMkdir is called by client to make a new directory
 func (m *Master) RPCMkdir(args gfs.MkdirArg, replay *gfs.MkdirReply) error {
+	util.MasterLogf("Mkdir {%s}", args.Path)
 	err := m.nm.Mkdir(args.Path)
 	if err != nil {
 		return err
@@ -193,11 +231,22 @@ func (m *Master) RPCGetFileInfo(args gfs.GetFileInfoArg, reply *gfs.GetFileInfoR
 // RPCGetChunkHandle returns the chunk handle of (path, index).
 // If the requested index is bigger than the number of chunks of this path by exactly one, create one.
 func (m *Master) RPCGetChunkHandle(args gfs.GetChunkHandleArg, reply *gfs.GetChunkHandleReply) error {
-	chunk, err := m.cm.GetChunk(args.Path, args.Index)
+	flag, chunk, err := m.cm.GetChunk(args.Path, args.Index)
 	if err != nil {
 		return err
 	}
+	if flag {
+		err, chunk = m.createChunk(args.Path)
+		if err != nil {
+			return err
+		}
+	}
 	reply.Handle = chunk
+	return nil
+}
+
+func (m *Master) RPCGetLastChunkHandle(args gfs.GetLastChunkHandleArg, reply *gfs.GetLastChunkHandleReply) error {
+	reply.Handle, reply.Index, _ = m.cm.GetLastChunkHandle(args.Path)
 	return nil
 }
 

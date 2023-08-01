@@ -2,11 +2,11 @@ package main
 
 import (
 	"fmt"
-	log "main/src/github.com/Sirupsen/logrus"
+	log "gfsmain/src/github.com/Sirupsen/logrus"
 
-	"main/src/gfs"
-	"main/src/gfs/chunkserver"
-	"main/src/gfs/master"
+	"gfsmain/src/gfs"
+	"gfsmain/src/gfs/chunkserver"
+	"gfsmain/src/gfs/master"
 	"os"
 )
 
