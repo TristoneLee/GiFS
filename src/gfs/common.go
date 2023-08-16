@@ -13,6 +13,12 @@ type ChunkIndex int
 type ChunkHandle int64
 type ChunkVersion int64
 
+type HandleOrder []ChunkHandle
+
+func (a HandleOrder) Len() int           { return len(a) }
+func (a HandleOrder) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a HandleOrder) Less(i, j int) bool { return int64(a[i]) < int64(a[j]) }
+
 type DataBufferID struct {
 	Handle    ChunkHandle
 	TimeStamp int

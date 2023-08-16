@@ -1,14 +1,17 @@
 package chunkserver
 
 import (
+	"bytes"
+	"encoding/gob"
 	"gfsmain/src/gfs"
 	"gfsmain/src/gfs/util"
-	log "gfsmain/src/github.com/Sirupsen/logrus"
 	"github.com/sasha-s/go-deadlock"
+	log "github.com/sirupsen/logrus"
 	"net"
 	"net/rpc"
 	"os"
 	"path"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -34,12 +37,22 @@ type Mutation struct {
 	offset  gfs.Offset
 }
 
+const MetaOffset int64 = 16
+
 type chunkInfo struct {
 	deadlock.RWMutex
 	length        gfs.Offset
-	version       gfs.ChunkVersion               // version number of the chunk in disk
-	newestVersion gfs.ChunkVersion               // allocated newest version number
-	mutations     map[gfs.ChunkVersion]*Mutation // mutation buffer
+	version       gfs.ChunkVersion // version number of the chunk in disk
+	newestVersion gfs.ChunkVersion // allocated newest version number
+	mutations     []Mutation       // mutation buffer
+}
+
+func (cs *ChunkServer) infoPersist(handle gfs.ChunkHandle, info *chunkInfo, encoder *gob.Encoder) {
+	cs.applyChunkMutation(handle, info)
+	info.Lock()
+	defer info.Unlock()
+	encoder.Encode(info.length)
+	encoder.Encode(info.version)
 }
 
 // NewAndServe starts a chunkserver and return the pointer to it.
@@ -53,6 +66,7 @@ func NewAndServe(addr, masterAddr gfs.ServerAddress, serverRoot string) *ChunkSe
 		pendingLeaseExtensions: new(util.ArraySet),
 		chunk:                  make(map[gfs.ChunkHandle]*chunkInfo),
 	}
+	cs.readPersist()
 	rpcs := rpc.NewServer()
 	rpcs.Register(cs)
 	l, e := net.Listen("tcp", string(cs.address))
@@ -111,6 +125,13 @@ func NewAndServe(addr, masterAddr gfs.ServerAddress, serverRoot string) *ChunkSe
 		}
 	}()
 
+	go func() {
+		for {
+			cs.commit()
+			time.Sleep(10 * gfs.HeartbeatInterval)
+		}
+	}()
+
 	log.Infof("ChunkServer is now running. addr = %v, root path = %v, master addr = %v", addr, serverRoot, masterAddr)
 
 	return cs
@@ -118,25 +139,115 @@ func NewAndServe(addr, masterAddr gfs.ServerAddress, serverRoot string) *ChunkSe
 
 //func (cs *ChunkServer) persist() {
 //	w := new(bytes.Buffer)
-//	e:=gob.NewEncoder(w)
+//	encoder := gob.NewEncoder(w)
+//	encoder.Encode(len(cs.chunk))
 //	for handle, info := range cs.chunk {
-//		info.RLock()
-//		e.Encode(handle)
-//		e.Encode(info)
-//		info.RUnlock()
+//		encoder.Encode(handle)
+//		cs.infoPersist(handle,info,encoder)
 //	}
+//	file, _ := os.OpenFile(path.Join(cs.serverRoot, "persistMeta"), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+//	file.Write(w.Bytes())
+//	file.Close()
 //}
 //
-//func (cs *ChunkServer) readPersist{
-//
-//}
-//
-//func (cs *ChunkServer) applyMutation{
-//	for handle, info := range cs.chunk {
-//		info.Lock()
-//		if info.mutations
-//	}
-//}
+
+func (cs *ChunkServer) readPersist() {
+	dir, _ := os.ReadDir(cs.serverRoot)
+	for _, entry := range dir {
+		handle, err := strconv.ParseInt(entry.Name(), 10, 64)
+		if err != nil {
+			log.Panic(err)
+		}
+		file, _ := os.OpenFile(path.Join(cs.serverRoot, entry.Name()), os.O_RDWR, 0666)
+		decoder := gob.NewDecoder(file)
+		var version gfs.ChunkVersion
+		var length gfs.Offset
+		decoder.Decode(&length)
+		decoder.Decode(&version)
+		cs.chunk[gfs.ChunkHandle(handle)] = &chunkInfo{
+			RWMutex:       deadlock.RWMutex{},
+			length:        length,
+			version:       version,
+			newestVersion: 0,
+			mutations:     nil,
+		}
+	}
+}
+
+func (cs *ChunkServer) commit() {
+	for handle, info := range cs.chunk {
+		cs.applyChunkMutation(handle, info)
+	}
+}
+
+func (cs *ChunkServer) applyChunkMutation(handle gfs.ChunkHandle, info *chunkInfo) {
+	info.Lock()
+	defer info.Unlock()
+	for len(info.mutations) != 0 {
+		mut := info.mutations[0]
+		switch mut.mtype {
+		case gfs.MutationWrite:
+			file, err := os.OpenFile(path.Join(cs.serverRoot, strconv.FormatInt(int64(handle), 10)), os.O_RDWR, 0755)
+			if err != nil {
+				log.Fatal("chunk server cannot open file ", err)
+			}
+			w := new(bytes.Buffer)
+			e := gob.NewEncoder(w)
+			e.Encode(mut.version)
+			file.WriteAt(w.Bytes(), 0)
+			file.WriteAt(mut.data, int64(w.Len())+int64(mut.offset))
+			file.Close()
+			break
+		case gfs.MutationAppend:
+			file, err := os.OpenFile(path.Join(cs.serverRoot, strconv.FormatInt(int64(handle), 10)), os.O_RDWR, 0755)
+			if err != nil {
+				log.Fatal("chunk server cannot open file ", err)
+			}
+			w := new(bytes.Buffer)
+			e := gob.NewEncoder(w)
+			e.Encode(mut.version)
+			file.WriteAt(w.Bytes(), 0)
+			file.WriteAt(mut.data, int64(w.Len())+int64(mut.offset))
+			file.Close()
+			break
+		}
+		info.mutations = info.mutations[1:]
+	}
+}
+
+func (cs *ChunkServer) garbageCollection() {
+	handlesInRoot := make([]gfs.ChunkHandle, 0)
+	dir, _ := os.ReadDir(cs.serverRoot)
+	for _, entry := range dir {
+		handle, err := strconv.ParseInt(entry.Name(), 10, 64)
+		if err != nil {
+			log.Panic(err)
+		}
+		handlesInRoot = append(handlesInRoot, gfs.ChunkHandle(handle))
+	}
+	sort.Sort(gfs.HandleOrder(handlesInRoot))
+	handlesInTrace := make([]gfs.ChunkHandle, 0)
+	handlesToDel := make([]gfs.ChunkHandle, 0)
+	for handle, _ := range cs.chunk {
+		handlesInTrace = append(handlesInTrace, handle)
+	}
+	sort.Sort(gfs.HandleOrder(handlesInTrace))
+	util.ServerLogf(cs.address, "performing GC \nchunks in trace:%v\nchunks in root\n", handlesInTrace, handlesInRoot)
+	tracePtr := 0
+	rootPtr := 0
+	for tracePtr < len(handlesInTrace) && rootPtr < len(handlesInRoot) {
+		if handlesInTrace[tracePtr] == handlesInRoot[rootPtr] {
+			tracePtr += 1
+			rootPtr += 1
+		} else {
+			handlesToDel = append(handlesToDel, handlesInRoot[rootPtr])
+			rootPtr += 1
+		}
+	}
+	for _, handle := range handlesToDel {
+		os.Remove(path.Join(cs.serverRoot, strconv.FormatInt(int64(handle), 10)))
+	}
+}
 
 // Shutdown shuts the chunkserver down
 func (cs *ChunkServer) Shutdown() {
@@ -213,7 +324,7 @@ func (cs *ChunkServer) RPCCreateChunk(args gfs.CreateChunkArg, reply *gfs.Create
 		length:        0,
 		version:       0,
 		newestVersion: 0,
-		mutations:     make(map[gfs.ChunkVersion]*Mutation),
+		mutations:     make([]Mutation, 0),
 	}
 	_, err := os.Create(path.Join(cs.serverRoot, strconv.FormatInt(int64(args.Handle), 10)))
 	if err != nil {
@@ -225,6 +336,7 @@ func (cs *ChunkServer) RPCCreateChunk(args gfs.CreateChunkArg, reply *gfs.Create
 
 // RPCReadChunk is called by client, read chunk data and return
 func (cs *ChunkServer) RPCReadChunk(args gfs.ReadChunkArg, reply *gfs.ReadChunkReply) error {
+	cs.applyChunkMutation(args.Handle, cs.chunk[args.Handle])
 	file, err := os.OpenFile(path.Join(cs.serverRoot, strconv.FormatInt(int64(args.Handle), 10)), os.O_RDWR, 0755)
 	if err != nil {
 		log.Fatal("chunk server cannot open file", err)
@@ -265,12 +377,12 @@ func (cs *ChunkServer) RPCWriteChunk(args gfs.WriteChunkArg, reply *gfs.WriteChu
 	chunk.Lock()
 	defer chunk.Unlock()
 	chunk.newestVersion += 1
-	chunk.mutations[chunk.newestVersion] = &Mutation{
+	chunk.mutations = append(chunk.mutations, Mutation{
 		mtype:   gfs.MutationWrite,
 		version: chunk.newestVersion,
 		data:    data,
 		offset:  offset,
-	}
+	})
 	file, err := os.OpenFile(path.Join(cs.serverRoot, strconv.FormatInt(int64(args.Handle), 10)), os.O_RDWR, 0755)
 	if err != nil {
 		log.Fatal("chunk server cannot open file ", err)
@@ -342,12 +454,12 @@ func (cs *ChunkServer) RPCAppendChunk(args gfs.AppendChunkArg, reply *gfs.Append
 	chunk.Lock()
 	if int(chunk.length)+len(data) > gfs.MaxChunkSize {
 		chunk.newestVersion += 1
-		chunk.mutations[chunk.newestVersion] = &Mutation{
+		chunk.mutations = append(chunk.mutations, Mutation{
 			mtype:   gfs.MutationPad,
 			version: chunk.newestVersion,
 			data:    nil,
 			offset:  0,
-		}
+		})
 		chunk.length = gfs.MaxChunkSize
 		reply.ErrorCode = gfs.AppendExceedChunkSize
 		reply.Offset = 0
@@ -355,12 +467,12 @@ func (cs *ChunkServer) RPCAppendChunk(args gfs.AppendChunkArg, reply *gfs.Append
 	}
 	reply.Offset = cs.chunk[handle].length
 	chunk.newestVersion += 1
-	chunk.mutations[chunk.newestVersion] = &Mutation{
+	chunk.mutations = append(chunk.mutations, Mutation{
 		mtype:   gfs.MutationAppend,
 		version: chunk.newestVersion,
 		data:    data,
 		offset:  reply.Offset,
-	}
+	})
 	file, err := os.OpenFile(path.Join(cs.serverRoot, strconv.FormatInt(int64(args.Handle), 10)), os.O_RDWR, 0755)
 	if err != nil {
 		log.Fatal("chunk server cannot open file ", err)
@@ -448,7 +560,7 @@ func (cs *ChunkServer) RPCApplyCopy(args gfs.ApplyCopyArg, reply *gfs.ApplyCopyR
 		length:        0,
 		version:       0,
 		newestVersion: 0,
-		mutations:     make(map[gfs.ChunkVersion]*Mutation),
+		mutations:     make([]Mutation, 0),
 	}
 	util.ServerLogf(cs.address, "apply replica of chunk %v", args.Handle)
 	chunk := cs.chunk[args.Handle]

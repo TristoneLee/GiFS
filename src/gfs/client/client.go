@@ -3,7 +3,7 @@ package client
 import (
 	"gfsmain/src/gfs"
 	"gfsmain/src/gfs/util"
-	log "gfsmain/src/github.com/Sirupsen/logrus"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/huandu/go-clone"
 )

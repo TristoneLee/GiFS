@@ -2,8 +2,8 @@ package master
 
 import (
 	"gfsmain/src/gfs"
-	log "gfsmain/src/github.com/Sirupsen/logrus"
 	"github.com/sasha-s/go-deadlock"
+	log "github.com/sirupsen/logrus"
 	"strings"
 )
 
@@ -19,14 +19,17 @@ type nsTree struct {
 	children map[string]*nsTree
 
 	// if it is a file
-	length int64
-	chunks int64
+	//length int64
+	//chunks int64
 }
 
 func newNamespaceManager() *namespaceManager {
 	nm := &namespaceManager{
-		root: &nsTree{isDir: true,
-			children: make(map[string]*nsTree)},
+		root: &nsTree{
+			RWMutex:  deadlock.RWMutex{},
+			isDir:    true,
+			children: make(map[string]*nsTree),
+		},
 	}
 	return nm
 }
@@ -128,10 +131,10 @@ func (nm *namespaceManager) QueryDir(p gfs.Path) (files []gfs.PathInfo, err erro
 	for name, tree := range ptr.children {
 		tree.RLock()
 		ret = append(ret, gfs.PathInfo{
-			Name:   name,
-			IsDir:  tree.isDir,
-			Length: tree.length,
-			Chunks: tree.chunks,
+			Name:  name,
+			IsDir: tree.isDir,
+			//Length: tree.length,
+			//Chunks: tree.chunks,
 		})
 		tree.RUnlock()
 	}
@@ -163,9 +166,9 @@ func (nm *namespaceManager) QueryFile(p gfs.Path) (info gfs.PathInfo, err error)
 	ptr.RLock()
 	defer ptr.RUnlock()
 	return gfs.PathInfo{
-		Name:   pArgs[len(pArgs)-1],
-		IsDir:  false,
-		Length: ptr.length,
-		Chunks: ptr.chunks,
+		Name:  pArgs[len(pArgs)-1],
+		IsDir: false,
+		//Length: ptr.length,
+		//Chunks: ptr.chunks,
 	}, nil
 }

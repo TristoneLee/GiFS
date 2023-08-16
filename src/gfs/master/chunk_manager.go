@@ -3,8 +3,8 @@ package master
 import (
 	"gfsmain/src/gfs"
 	"gfsmain/src/gfs/util"
-	log "gfsmain/src/github.com/Sirupsen/logrus"
 	"github.com/sasha-s/go-deadlock"
+	log "github.com/sirupsen/logrus"
 	"time"
 )
 

@@ -2,7 +2,7 @@ package master
 
 import (
 	"gfsmain/src/gfs/util"
-	log "gfsmain/src/github.com/Sirupsen/logrus"
+	log "github.com/sirupsen/logrus"
 	"net"
 	"net/rpc"
 	"time"
@@ -16,10 +16,10 @@ type Master struct {
 	serverRoot string            // path to metadata storage
 	l          net.Listener
 	shutdown   chan struct{}
-
-	nm  *namespaceManager
-	cm  *chunkManager
-	csm *chunkServerManager
+	ps         persister
+	nm         *namespaceManager
+	cm         *chunkManager
+	csm        *chunkServerManager
 }
 
 // NewAndServe starts a master and returns the pointer to it.
@@ -33,7 +33,13 @@ func NewAndServe(address gfs.ServerAddress, serverRoot string) *Master {
 	m.nm = newNamespaceManager()
 	m.cm = newChunkManager()
 	m.csm = newChunkServerManager()
-
+	m.ps = persister{
+		serverRoot: serverRoot,
+		nm:         m.nm,
+		cm:         m.cm,
+		csm:        m.csm,
+	}
+	m.ps.readPersist()
 	rpcs := rpc.NewServer()
 	rpcs.Register(m)
 	l, e := net.Listen("tcp", string(m.address))
@@ -83,7 +89,6 @@ func NewAndServe(address gfs.ServerAddress, serverRoot string) *Master {
 	}()
 
 	log.Infof("Master is running now. addr = %v, root path = %v", address, serverRoot)
-
 	return m
 }
 
@@ -130,10 +135,6 @@ func (m *Master) RefillReplica() {
 	}
 }
 
-func (m *Master) Backup() {
-
-}
-
 // RPCHeartbeat is called by chunkserver to let the master know that a chunkserver is alive.
 // Lease extension request is included.
 func (m *Master) RPCHeartbeat(args gfs.HeartbeatArg, reply *gfs.HeartbeatReply) error {
@@ -175,6 +176,7 @@ func (m *Master) RPCCreateFile(args gfs.CreateFileArg, reply *gfs.CreateFileRepl
 		return err
 	}
 	err, _ = m.createChunk(args.Path)
+	go m.ps.persist()
 	return err
 }
 
@@ -202,6 +204,7 @@ func (m *Master) createChunk(path gfs.Path) (error, gfs.ChunkHandle) {
 			}
 		}(server, handle)
 	}
+	go m.ps.persistChunkManager()
 	time.Sleep(10 * time.Millisecond)
 	return nil, handle
 }
@@ -213,6 +216,7 @@ func (m *Master) RPCMkdir(args gfs.MkdirArg, replay *gfs.MkdirReply) error {
 	if err != nil {
 		return err
 	}
+	go m.ps.persistNamespaceManager()
 	return nil
 }
 
